@@ -544,8 +544,25 @@ const startServer = async () => {
   })
 }
 
+const redactStartupError = (value) => {
+  let text = String(value || '')
+  for (const [name, secret] of Object.entries(process.env)) {
+    if (secret && secret.length >= 4 && /(secret|password|token|api[_-]?key|credential|uri)/i.test(name)) {
+      text = text.replaceAll(secret, '[REDACTED]')
+    }
+  }
+  return text
+    .replace(/mongodb(?:\+srv)?:\/\/[^\s"'`]+/gi, '[REDACTED_MONGODB_URI]')
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s:]+:[^/@\s]+@/gi, '$1[REDACTED]@')
+    .replace(/((?:api[_-]?key|secret|password|token)\s*[=:]\s*)[^\s,;"'`]+/gi, '$1[REDACTED]')
+}
+
 startServer().catch((error) => {
-  console.error('Backend startup failed')
+  const message = error instanceof Error ? error.message : String(error)
+  console.error('Backend startup failed:', redactStartupError(message))
+  if (error instanceof Error && error.stack) {
+    console.error(redactStartupError(error.stack))
+  }
   process.exit(1)
 })
 
