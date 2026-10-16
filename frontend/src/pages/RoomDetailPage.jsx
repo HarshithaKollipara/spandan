@@ -15,6 +15,7 @@ import Leaderboard from '../components/Leaderboard'
 import { saveTranscript } from '../services/transcriptService'
 import { getTranscriptionStatus } from '../services/serverTranscriptionService'
 import { createRecordingPipeline } from '../services/recordingPipelineService'
+import { appendTranscriptEntry, createQuestionGenerationPayload, formatTranscriptEntries, getCurrentSegmentTranscript, resetTranscriptEntries } from '../services/transcriptContext'
 import { API_URL } from '../config.js'
 
 function RoomDetailPage() {
@@ -94,6 +95,15 @@ function RoomDetailPage() {
 
   // Discussion mode state
   const [isDiscussionActive, setIsDiscussionActive] = useState(false)
+  const completeTranscriptEntriesRef = useRef([])
+  const [completeTranscriptEntries, setCompleteTranscriptEntries] = useState([])
+  const appendCompleteTranscriptEntry = useCallback((entry) => {
+    const updated = appendTranscriptEntry(completeTranscriptEntriesRef.current, entry)
+    if (updated !== completeTranscriptEntriesRef.current) {
+      completeTranscriptEntriesRef.current = updated
+      setCompleteTranscriptEntries(updated)
+    }
+  }, [])
   const [pendingHands, setPendingHands] = useState([])
   const [approvedSpeakers, setApprovedSpeakers] = useState([])
   const [discussionError, setDiscussionError] = useState('')
@@ -202,6 +212,11 @@ function RoomDetailPage() {
       setApprovedSpeakers(state.approvedSpeakers || [])
     }
 
+    const handleDiscussionTranscript = ({ roomId: transcriptRoomId, entry }) => {
+      if (String(transcriptRoomId) !== String(room?._id) || !entry?.text?.trim()) return
+      appendCompleteTranscriptEntry(entry)
+    }
+
     const handleDiscussionError = (err) => {
       if (err?.message) {
         setDiscussionError(err.message)
@@ -210,15 +225,17 @@ function RoomDetailPage() {
     }
 
     socket.on('discussion:update', handleDiscussionUpdate)
+    socket.on('discussion:transcript', handleDiscussionTranscript)
     socket.on('discussion:error', handleDiscussionError)
 
     return () => {
       socket.off('new_question', handleQuestionLaunched)
       socket.off('question:started', handleQuestionLaunched)
       socket.off('discussion:update', handleDiscussionUpdate)
+      socket.off('discussion:transcript', handleDiscussionTranscript)
       socket.off('discussion:error', handleDiscussionError)
     }
-  }, [socket, roomSettings.timeToAnswer])
+  }, [socket, roomSettings.timeToAnswer, room?._id, appendCompleteTranscriptEntry])
 
   // Auto-scroll transcription
   useEffect(() => {
@@ -409,25 +426,6 @@ function RoomDetailPage() {
     return new Promise(async (resolve, reject) => {
       setIsGeneratingQuestions(true)
 
-      // If a discussion session is active, always use the discussion transcript (formatted)
-      let transcriptToSend = text
-      try {
-        if (room?._id && isDiscussionActive) {
-          const discRes = await fetch(`${API_URL}/discussion/${room._id}/transcript`, {
-            headers: { 'Authorization': `Bearer ${token}` }
-          })
-          if (discRes.ok) {
-            const discData = await discRes.json()
-            if (discData.success) {
-              // Use the formatted discussion transcript even if it contains only teacher entries
-              transcriptToSend = discData.transcript || ''
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('Failed to fetch discussion transcript, falling back to teacher transcript', e)
-      }
-
       try {
         const response = await fetch(`${API_URL}/questions/generate`, {
           method: 'POST',
@@ -435,14 +433,14 @@ function RoomDetailPage() {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${token}`
           },
-          body: JSON.stringify({
-            transcript: transcriptToSend,
-            config: {
+          body: JSON.stringify(createQuestionGenerationPayload(
+            text,
+            {
               numQuestions: roomSettings.questionsPerSegment,
               difficulty: roomSettings.difficulty,
               provider: roomSettings.questionProvider || 'minimax'
             }
-          })
+          ))
         })
 
         const data = await response.json()
@@ -640,17 +638,24 @@ function RoomDetailPage() {
         setTranscript(finalTranscriptRef.current)
         segmentTranscriptRef.current += ' ' + text
         setSegmentTranscript(segmentTranscriptRef.current)
+        appendCompleteTranscriptEntry(nextItem.discussionEntry || {
+          id: `teacher-${nextItem.sequence}-${Date.now()}`,
+          speakerRole: 'teacher',
+          speakerName: 'Teacher',
+          text,
+          timestamp: new Date().toISOString()
+        })
       }
 
       pendingSequenceRef.current++
     }
 
     isProcessingQueueRef.current = false
-  }, [])
+  }, [appendCompleteTranscriptEntry])
 
   // Add transcription result to queue
-  const addToTranscriptionQueue = useCallback((sequence, text) => {
-    transcriptionQueueRef.current.push({ sequence, text })
+  const addToTranscriptionQueue = useCallback((sequence, text, discussionEntry) => {
+    transcriptionQueueRef.current.push({ sequence, text, discussionEntry })
     // Sort by sequence to maintain order
     transcriptionQueueRef.current.sort((a, b) => a.sequence - b.sequence)
     processTranscriptionQueue()
@@ -662,8 +667,8 @@ function RoomDetailPage() {
         speakerRole: 'teacher',
         speakerId: null,
         roomId: room?._id,
-        onTranscription: (sequence, text) => {
-          addToTranscriptionQueue(sequence, text)
+        onTranscription: (sequence, text, metadata, discussionEntry) => {
+          addToTranscriptionQueue(sequence, text, discussionEntry)
         },
         onStatus: (status) => setModelStatus(status),
         onError: (error) => {
@@ -686,6 +691,8 @@ function RoomDetailPage() {
     if (isRecording) return
 
     try {
+      completeTranscriptEntriesRef.current = resetTranscriptEntries()
+      setCompleteTranscriptEntries(completeTranscriptEntriesRef.current)
       setTranscript('')
       finalTranscriptRef.current = ''
       accumulatedTranscriptRef.current = ''
@@ -742,10 +749,12 @@ function RoomDetailPage() {
     finalTranscriptRef.current = ''
     setSegmentTranscript('')
     segmentTranscriptRef.current = ''
+    completeTranscriptEntriesRef.current = resetTranscriptEntries()
+    setCompleteTranscriptEntries(completeTranscriptEntriesRef.current)
   }
 
   const handleManualGenerateQuestions = async () => {
-    const textToUse = segmentTranscript.trim() || transcript
+    const textToUse = getCurrentSegmentTranscript(segmentTranscript, transcript)
     if (!textToUse) {
       alert('No transcript available to generate questions from.')
       return
@@ -1466,7 +1475,7 @@ function RoomDetailPage() {
                   )}
                 </div>
                 <div style={{ display: 'flex', gap: '8px' }}>
-                  {transcript && (
+                  {(transcript || completeTranscriptEntries.length > 0) && (
                     <button onClick={clearTranscript} style={{
                       padding: '4px 12px',
                       background: 'transparent',
@@ -1481,7 +1490,7 @@ function RoomDetailPage() {
                   )}
                   <button
                     onClick={handleManualGenerateQuestions}
-                    disabled={isGeneratingQuestions || !transcript || !generateQEnabled}
+                    disabled={isGeneratingQuestions || (!transcript && completeTranscriptEntries.length === 0) || !generateQEnabled}
                     style={{
                       padding: '4px 12px',
                       background: '#3b82f6',
@@ -1490,8 +1499,8 @@ function RoomDetailPage() {
                       borderRadius: '6px',
                       fontSize: '12px',
                       fontWeight: '500',
-                      cursor: isGeneratingQuestions || !transcript || !generateQEnabled ? 'not-allowed' : 'pointer',
-                      opacity: isGeneratingQuestions || !transcript || !generateQEnabled ? 0.6 : 1,
+                      cursor: isGeneratingQuestions || (!transcript && completeTranscriptEntries.length === 0) || !generateQEnabled ? 'not-allowed' : 'pointer',
+                      opacity: isGeneratingQuestions || (!transcript && completeTranscriptEntries.length === 0) || !generateQEnabled ? 0.6 : 1,
                       display: 'flex',
                       alignItems: 'center',
                       gap: '4px'
@@ -1506,12 +1515,12 @@ function RoomDetailPage() {
                 flex: 1,
                 fontSize: '15px',
                 lineHeight: '1.8',
-                color: transcript ? 'var(--text-primary)' : 'var(--text-secondary)',
+                color: (completeTranscriptEntries.length || transcript) ? 'var(--text-primary)' : 'var(--text-secondary)',
                 whiteSpace: 'pre-wrap',
                 wordBreak: 'break-word',
                 overflowY: 'auto'
               }}>
-                {transcript ? transcript : (
+                {completeTranscriptEntries.length > 0 ? formatTranscriptEntries(completeTranscriptEntries) : transcript ? transcript : (
                   <span style={{ fontStyle: 'italic' }}>
                     Click the microphone to start real-time transcription.
                   </span>

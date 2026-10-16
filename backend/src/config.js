@@ -9,6 +9,7 @@ export const config = {
   openaiApiKey: process.env.OPENAI_API_KEY || '',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   googleApiKey: process.env.GOOGLE_API_KEY || '',
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
   nodeEnv: process.env.NODE_ENV || 'development'
 }
 

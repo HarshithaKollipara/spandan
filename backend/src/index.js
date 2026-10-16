@@ -7,6 +7,11 @@ import { Server } from 'socket.io'
 import jwt from 'jsonwebtoken'
 import dotenv from 'dotenv'
 import mongoose from 'mongoose'
+import { getHealthStatus, getJwtSecret, validateProductionConfig } from './utils/productionConfig.js'
+import { authorizeSocketRoom, createSocketAuthMiddleware } from './utils/socketAuthorization.js'
+import User from './models/User.js'
+import Room from './models/Room.js'
+import RoomMember from './models/RoomMember.js'
 
 // Import routes
 import authRoutes from './routes/auth.js'
@@ -24,7 +29,13 @@ import './models/index.js'
 dotenv.config()
 
 const BASE_PATH = process.env.BASE_PATH || ''
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:3001').split(',').map(s => s.trim())
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
+const FRONTEND_ORIGIN = new URL(FRONTEND_URL).origin
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || `${FRONTEND_ORIGIN},http://localhost:5173,http://localhost:3001`).split(',').map(s => s.trim())
+const HTTP_CORS_ORIGINS = [...new Set([
+  FRONTEND_ORIGIN,
+  ...CORS_ORIGINS
+])]
 
 // Request timeout middleware - defined BEFORE use due to hoisting
 const requestTimeout = (req, res, next) => {
@@ -99,7 +110,7 @@ const leaderboardLimiter = rateLimit({
 // Middleware
 app.use(helmet())
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: HTTP_CORS_ORIGINS,
   credentials: true
 }))
 app.use(express.json({ limit: '10mb' }))
@@ -122,11 +133,12 @@ app.use('/api/responses', responseRoutes)
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  const health = getHealthStatus(mongoose.connection.readyState)
+  res.status(health.httpStatus).json({
+    status: health.status,
     version: '0.5.0',
     timestamp: new Date().toISOString(),
-    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    mongodb: health.mongodb
   })
 })
 
@@ -151,20 +163,26 @@ const broadcastDiscussionState = (roomCode) => {
   const state = getDiscussionState(roomCode)
   io.to(roomCode).emit('discussion:update', state)
 }
+
+io.use(createSocketAuthMiddleware({ jwt, getSecret: getJwtSecret, User }))
+
+const canAccessRoom = async (socket, roomCode) => {
+  return authorizeSocketRoom({ user: socket.user, userId: socket.userId, roomCode, Room, RoomMember })
+}
+
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id)
+  connectedUsers.set(socket.id, socket.userId)
 
   // Authenticate socket
   socket.on('authenticate', (data) => {
     try {
-      if (!data.token) {
+      if (!data?.token) {
         socket.emit('authenticated', { success: false, error: 'No token provided' })
         return
       }
-      const decoded = jwt.verify(data.token, process.env.JWT_SECRET || 'your-secret-key-change-in-production')
-      connectedUsers.set(socket.id, decoded.userId)
-      socket.userId = decoded.userId
-      socket.emit('authenticated', { success: true })
+      const decoded = jwt.verify(data.token, getJwtSecret())
+      socket.emit('authenticated', { success: String(decoded.userId) === socket.userId })
     } catch (error) {
       if (error.name === 'TokenExpiredError') {
         socket.emit('authenticated', { success: false, error: 'Token expired', expired: true })
@@ -175,98 +193,51 @@ io.on('connection', (socket) => {
   })
 
   // Join room
-  socket.on('room:join', async ({ roomCode, userId }) => {
+  socket.on('room:join', async ({ roomCode } = {}) => {
     try {
-      const Room = (await import('./models/Room.js')).default
-      const User = (await import('./models/User.js')).default
-      const RoomMember = (await import('./models/RoomMember.js')).default
-      
+      const room = await canAccessRoom(socket, roomCode)
+      if (!room) return socket.emit('room:join:error', { message: 'Access denied' })
       socket.join(roomCode)
-      console.log(`Client ${socket.id} (user: ${userId}) joining room ${roomCode}`)
-      
-      // Find user and room
-      const user = await User.findById(userId)
-      const room = await Room.findByCode(roomCode)
-      
-      let participantCount = 0
-      
-      if (user && room) {
-        // Only students get added to RoomMember (not teachers)
-        if (user.role === 'student') {
-          // Upsert: add student to room members if not already there
-          await RoomMember.findOneAndUpdate(
-            { roomId: room._id, studentId: user._id },
-            { roomId: room._id, studentId: user._id, joinedAt: new Date() },
-            { upsert: true, new: true }
-          )
-          console.log(`Student ${userId} added to room members for room ${roomCode}`)
-        }
-        
-        // Count participants from RoomMember (excludes teacher)
-        const memberCount = await RoomMember.countDocuments({ roomId: room._id })
-        participantCount = memberCount
-      }
-      
-      io.to(roomCode).emit('room:joined', { 
-        roomCode, 
-        userId,
-        participants: participantCount 
-      })
+      const participantCount = await RoomMember.countDocuments({ roomId: room._id })
+      socket.emit('room:joined', { roomCode, userId: socket.userId, participants: participantCount })
 
       // Send current discussion state when a client joins the room
       const currentState = getDiscussionState(roomCode)
-      io.to(roomCode).emit('discussion:update', currentState)
+      socket.emit('discussion:update', currentState)
     } catch (error) {
       console.error('Error in room:join:', error)
-      io.to(roomCode).emit('room:joined', { 
-        roomCode, 
-        userId,
-        participants: 0 
-      })
+      socket.emit('room:join:error', { message: 'Unable to join room' })
     }
   })
 
   // Leave room
-  socket.on('room:leave', async ({ roomCode, userId }) => {
+  socket.on('room:leave', async ({ roomCode } = {}) => {
     try {
-      const Room = (await import('./models/Room.js')).default
-      const User = (await import('./models/User.js')).default
-      const RoomMember = (await import('./models/RoomMember.js')).default
-      
+      const room = await canAccessRoom(socket, roomCode)
+      if (!room || !socket.rooms.has(roomCode)) return
       socket.leave(roomCode)
-      console.log(`Client ${socket.id} (user: ${userId}) left room ${roomCode}`)
-      
-      const user = await User.findById(userId)
-      const room = await Room.findByCode(roomCode)
-      
       let participantCount = 0
-      
-      if (user && room && user.role === 'student') {
+      if (socket.user.role === 'student') {
         // Remove student from room members
-        await RoomMember.deleteOne({ roomId: room._id, studentId: user._id })
-        
+        await RoomMember.deleteOne({ roomId: room._id, studentId: socket.userId })
         // Recount remaining participants
         participantCount = await RoomMember.countDocuments({ roomId: room._id })
       }
-      
       io.to(roomCode).emit('room:left', { 
         roomCode,
         participants: participantCount 
       })
     } catch (error) {
       console.error('Error in room:leave:', error)
-      io.to(roomCode).emit('room:left', { 
-        roomCode,
-        participants: 0 
-      })
     }
   })
 
   // Submit response (real-time)
   socket.on('response:submit', (data) => {
+    if (!socket.rooms.has(data?.roomCode) || socket.user.role !== 'student') return
     io.to(data.roomCode).emit('response:new', {
       questionId: data.questionId,
-      studentId: data.studentId,
+      studentId: socket.userId,
       selectedOption: data.selectedOption,
       responseTime: data.responseTime
     })
@@ -274,9 +245,10 @@ io.on('connection', (socket) => {
 
   // Points update event (emitted after response is saved with calculated points)
   socket.on('points:update', (data) => {
+    if (!socket.rooms.has(data?.roomCode) || socket.user.role !== 'student') return
     io.to(data.roomCode).emit('points:updated', {
       questionId: data.questionId,
-      studentId: data.studentId,
+      studentId: socket.userId,
       points: data.points,
       isCorrect: data.isCorrect
     })
@@ -284,6 +256,7 @@ io.on('connection', (socket) => {
 
   // Question events
   socket.on('question:start', (data) => {
+    if (!socket.rooms.has(data?.roomCode) || socket.user.role !== 'teacher') return
     io.to(data.roomCode).emit('question:started', {
       questionId: data.questionId,
       question: data.question,
@@ -293,6 +266,7 @@ io.on('connection', (socket) => {
   })
 
   socket.on('question:end', (data) => {
+    if (!socket.rooms.has(data?.roomCode) || socket.user.role !== 'teacher') return
     io.to(data.roomCode).emit('question:ended', {
       questionId: data.questionId,
       results: data.results
@@ -301,6 +275,7 @@ io.on('connection', (socket) => {
 
   // New question from teacher (manually created)
   socket.on('new_question', (data) => {
+    if (!socket.rooms.has(data?.roomCode) || socket.user.role !== 'teacher') return
     console.log('New question received from teacher:', data.question?.question?.substring(0, 50))
     const roomCode = data.roomCode
     const question = data.question
@@ -316,7 +291,7 @@ io.on('connection', (socket) => {
     const { roomCode, token } = data
     if (!roomCode || !token) return
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production')
+      const decoded = jwt.verify(token, getJwtSecret())
       const Room = (await import('./models/Room.js')).default
       const room = await Room.findByCode(roomCode)
       if (!room || room.teacher.toString() !== decoded.userId) return
@@ -342,7 +317,7 @@ io.on('connection', (socket) => {
     const { roomCode, token } = data
     if (!roomCode || !token) return
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production')
+      const decoded = jwt.verify(token, getJwtSecret())
       const Room = (await import('./models/Room.js')).default
       const room = await Room.findByCode(roomCode)
       if (!room || room.teacher.toString() !== decoded.userId) return
@@ -368,7 +343,7 @@ io.on('connection', (socket) => {
     const { roomCode, token } = data
     if (!roomCode || !token) return
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production')
+      const decoded = jwt.verify(token, getJwtSecret())
       const User = (await import('./models/User.js')).default
       const user = await User.findById(decoded.userId)
       const Room = (await import('./models/Room.js')).default
@@ -414,7 +389,7 @@ io.on('connection', (socket) => {
     const userId = data.userId || data.studentId
     if (!roomCode || !userId || !token) return
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production')
+      const decoded = jwt.verify(token, getJwtSecret())
       const Room = (await import('./models/Room.js')).default
       const room = await Room.findByCode(roomCode)
       if (!room || room.teacher.toString() !== decoded.userId) return
@@ -472,7 +447,7 @@ io.on('connection', (socket) => {
     const userId = data.userId || data.studentId
     if (!roomCode || !userId || !token) return
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production')
+      const decoded = jwt.verify(token, getJwtSecret())
       const Room = (await import('./models/Room.js')).default
       const room = await Room.findByCode(roomCode)
       if (!room || room.teacher.toString() !== decoded.userId) return
@@ -494,7 +469,7 @@ io.on('connection', (socket) => {
     const userId = data.userId || data.studentId
     if (!roomCode || !userId || !token) return
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production')
+      const decoded = jwt.verify(token, getJwtSecret())
       const Room = (await import('./models/Room.js')).default
       const room = await Room.findByCode(roomCode)
       if (!room || room.teacher.toString() !== decoded.userId) return
@@ -513,6 +488,7 @@ io.on('connection', (socket) => {
 
   // Leaderboard update
   socket.on('leaderboard:update', (data) => {
+    if (!socket.rooms.has(data?.roomCode) || socket.user.role !== 'teacher') return
     io.to(data.roomCode).emit('leaderboard:updated', data)
   })
 
@@ -549,7 +525,8 @@ const connectDB = async () => {
     
     console.log('MongoDB connected successfully')
   } catch (error) {
-    console.error('MongoDB connection error:', error.message)
+    console.error('MongoDB connection failed')
+    if (process.env.NODE_ENV === 'production') throw error
     console.log('Server will continue without database connection')
   }
 }
@@ -558,14 +535,18 @@ const PORT = process.env.PORT || 3001
 
 // Start server
 const startServer = async () => {
+  validateProductionConfig()
   await connectDB()
   
-  httpServer.listen(PORT, () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Spandan backend v0.5 running on port ${PORT}`)
     console.log(`Environment: ${process.env.NODE_ENV || 'development'}`)
   })
 }
 
-startServer().catch(console.error)
+startServer().catch((error) => {
+  console.error('Backend startup failed')
+  process.exit(1)
+})
 
 export { app, io }

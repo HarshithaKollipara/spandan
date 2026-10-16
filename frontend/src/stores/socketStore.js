@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { io } from 'socket.io-client'
 import { SOCKET_URL } from '../config.js'
+import useAuthStore from './authStore'
 
 export const useSocketStore = create((set, get) => ({
   socket: null,
@@ -11,20 +12,32 @@ export const useSocketStore = create((set, get) => ({
   connect: (token) => {
     const { socket: existingSocket } = get()
     if (existingSocket?.connected) {
-      console.log('Socket already connected, skipping')
+      if (token) {
+        existingSocket.emit('authenticate', { token })
+      }
       return
     }
 
     const socket = io(SOCKET_URL, {
       auth: { token },
-      path: '/spandan/socket.io',
+      path: '/socket.io',
       transports: ['websocket', 'polling']
     })
 
     socket.on('connect', () => {
       console.log('Socket connected')
       set({ isConnected: true })
-      socket.emit('authenticate', { token })
+      if (token) {
+        socket.emit('authenticate', { token })
+      }
+    })
+
+    socket.on('connect_error', (error) => {
+      set({ isConnected: false })
+      if (error?.data?.expired || error?.message === 'Token expired') {
+        useAuthStore.getState().logout()
+      }
+      console.error('Socket connection failed:', error?.message || 'Unknown connection error')
     })
 
     socket.on('disconnect', () => {
@@ -35,6 +48,12 @@ export const useSocketStore = create((set, get) => ({
     socket.on('authenticated', (data) => {
       if (!data.success) {
         console.error('Socket authentication failed:', data.error)
+        if (data.expired || data.error === 'Token expired') {
+          console.warn('Socket token expired - clearing expired session')
+          useAuthStore.getState().logout()
+        }
+      } else {
+        console.log('Socket authenticated successfully')
       }
     })
 

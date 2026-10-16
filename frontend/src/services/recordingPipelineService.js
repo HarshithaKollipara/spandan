@@ -47,7 +47,7 @@ export function createRecordingPipeline({ speakerRole, speakerId, roomId, onTran
     try {
       const wavBlob = await convertWebMToWav(audioBlob)
       const result = await transcribeAudio(wavBlob, getMetadata())
-      onTranscription?.(sequence, result.text || '', result.metadata || null)
+      onTranscription?.(sequence, result.text || '', result.metadata || null, result.discussionEntry || null)
     } catch (error) {
       onError?.(error)
     }

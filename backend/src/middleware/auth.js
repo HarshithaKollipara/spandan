@@ -1,8 +1,8 @@
 import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import User from '../models/User.js'
+import { getJwtSecret } from '../utils/productionConfig.js'
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production'
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d'
 
 export const authenticate = async (req, res, next) => {
@@ -18,7 +18,7 @@ export const authenticate = async (req, res, next) => {
 
     const token = authHeader.split(' ')[1]
     
-    const decoded = jwt.verify(token, JWT_SECRET)
+    const decoded = jwt.verify(token, getJwtSecret())
     
     const user = await User.findById(decoded.userId).select('-password')
     
@@ -71,7 +71,7 @@ export const authorize = (...roles) => {
 export const generateToken = (userId) => {
   return jwt.sign(
     { userId },
-    JWT_SECRET,
+    getJwtSecret(),
     { expiresIn: JWT_EXPIRY }
   )
 }

@@ -8,10 +8,14 @@ import Room from '../models/Room.js'
 const discussionTranscripts = new Map()
 
 const addDiscussionEntry = (roomId, entry) => {
-  if (!roomId) return
+  if (!roomId || !entry?.text?.trim()) return null
   // Only append if a discussion session has been initialized for this room
-  if (!discussionTranscripts.has(String(roomId))) return
-  discussionTranscripts.get(String(roomId)).push(entry)
+  if (!discussionTranscripts.has(String(roomId))) return null
+
+  const entries = discussionTranscripts.get(String(roomId))
+  if (entries.some(existing => existing.id === entry.id)) return null
+  entries.push(entry)
+  return entry
 }
 
 export const initDiscussionForRoom = (roomId) => {
@@ -59,6 +63,9 @@ router.get('/status', async (req, res) => {
 // Transcribe audio chunk
 router.post('/transcribe', async (req, res) => {
   try {
+    req.setTimeout(0)
+    res.setTimeout(0)
+
     if (!transcriber) {
       return res.status(503).json({ error: 'Transcription model not ready' })
     }
@@ -95,12 +102,19 @@ router.post('/transcribe', async (req, res) => {
     })
 
     // After successful transcription, record an in-memory discussion entry
+    let recordedEntry = null
     try {
       const text = result.text || ''
       let speakerName = null
+      let resolvedRole = speakerRole
       if (speakerId) {
         const user = await User.findById(speakerId).lean()
-        if (user) speakerName = user.name
+        if (user) {
+          speakerName = user.name
+          if (user.role === 'student' || user.role === 'teacher') {
+            resolvedRole = user.role
+          }
+        }
       }
       // If no speakerName and roomId present, and role is teacher, try to get room teacher name
       if (!speakerName && roomId && speakerRole === 'teacher') {
@@ -111,19 +125,33 @@ router.post('/transcribe', async (req, res) => {
         }
       }
       const entry = {
-        speakerRole: speakerRole || 'unknown',
-        speakerName: speakerName || (speakerRole === 'teacher' ? 'Teacher' : 'Student'),
+        id: `entry_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        speakerRole: resolvedRole || 'unknown',
+        speakerName: speakerName || (resolvedRole === 'teacher' ? 'Teacher' : 'Student'),
         text,
         timestamp: new Date().toISOString()
       }
-      if (roomId) addDiscussionEntry(roomId, entry)
+      recordedEntry = roomId ? addDiscussionEntry(roomId, entry) : null
+      if (recordedEntry && (resolvedRole === 'teacher' || resolvedRole === 'student')) {
+        const io = req.app.get('io')
+        const room = await Room.findById(roomId).select('code').lean()
+        if (io && room?.code) {
+          io.to(room.code).emit('discussion:transcript', {
+            roomId: String(roomId),
+            entry: recordedEntry
+          })
+        }
+      }
     } catch (err) {
       console.error('Failed to append discussion entry:', err)
     }
 
+    if (res.headersSent) return
+
     res.json({ 
       text: result.text || '',
       segments: result.segments || [],
+      discussionEntry: recordedEntry,
       metadata: {
         speakerRole: speakerRole || 'unknown',
         speakerId: speakerId || null,
@@ -132,7 +160,9 @@ router.post('/transcribe', async (req, res) => {
     })
   } catch (error) {
     console.error('Transcription error:', error)
-    res.status(500).json({ error: error.message })
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message })
+    }
   }
 })
 

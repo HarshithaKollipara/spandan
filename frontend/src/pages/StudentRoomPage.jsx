@@ -33,6 +33,7 @@ function StudentRoomPage() {
   const [discussionError, setDiscussionError] = useState('')
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [speakingStatus, setSpeakingStatus] = useState('Ready')
+  const [ownDiscussionTranscript, setOwnDiscussionTranscript] = useState('')
   const recordingPipelineRef = useRef(null)
   const timerIntervalRef = useRef(null)
 
@@ -115,6 +116,7 @@ function StudentRoomPage() {
         }
         setIsSpeaking(false)
         setSpeakingStatus('Ready')
+        setOwnDiscussionTranscript('')
         return
       }
 
@@ -135,6 +137,7 @@ function StudentRoomPage() {
         }
         setIsSpeaking(false)
         setSpeakingStatus('Ready')
+        setOwnDiscussionTranscript('')
       } else {
         setHandStatus('idle')
         if (recordingPipelineRef.current) {
@@ -142,6 +145,7 @@ function StudentRoomPage() {
         }
         setIsSpeaking(false)
         setSpeakingStatus('Ready')
+        setOwnDiscussionTranscript('')
       }
     }
 
@@ -348,6 +352,7 @@ function StudentRoomPage() {
 
   const startSpeaking = async () => {
     if (!discussionActive || handStatus !== 'approved' || !room?._id || !user?._id) return
+    setOwnDiscussionTranscript('')
 
     if (!recordingPipelineRef.current) {
       recordingPipelineRef.current = createRecordingPipeline({
@@ -356,6 +361,10 @@ function StudentRoomPage() {
         roomId: room._id,
         onTranscription: (sequence, text, metadata) => {
           console.log('[STUDENT TRANSCRIPTION]', { sequence, text, metadata })
+          const cleanText = text?.trim()
+          if (cleanText) {
+            setOwnDiscussionTranscript(prev => prev ? `${prev} ${cleanText}` : cleanText)
+          }
         },
         onStatus: setSpeakingStatus,
         onError: (error) => {
@@ -624,6 +633,11 @@ function StudentRoomPage() {
                     <div style={{ padding: '10px 14px', background: '#ffffff', borderRadius: '10px', border: '1px solid #d1fae5', color: '#065f46', fontSize: '14px', fontWeight: 600 }}>
                       {speakingStatus}
                     </div>
+                    {ownDiscussionTranscript && (
+                      <div style={{ padding: '10px 14px', background: '#ffffff', borderRadius: '10px', border: '1px solid #d1fae5', fontSize: '14px', fontWeight: 400 }}>
+                        <strong>Your transcription:</strong> {ownDiscussionTranscript}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
